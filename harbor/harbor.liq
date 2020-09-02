@@ -5,9 +5,15 @@ def ls_dir(path)
 end
 
 def pretty_seconds(seconds)
+    seconds = if seconds < 0. then 0. else seconds end
     string.trim(get_process_output(
         'python3 -c "import datetime as d; print(d.timedelta(seconds=#{string_of(int_of_float(seconds))}))"'))
 end
+
+def sanitize_password(password)
+    string.trim(string.case(lower=true, password))
+end
+
 
 shutting_down = ref false  # Avoid wacky shutdown notifications
 on_shutdown(fun() -> shutting_down := true)
@@ -92,9 +98,10 @@ dj_priority_harbor = input.harbor(
 )
 output.dummy(dj_priority_harbor, id='dj_priority_harbor_dummy', fallible=true)
 
+dj_priority_id = 'dj_priority_harbor_strip'
 dj_priority_harbor = strip_blank(
     max_blank=conf.float('DJ_MAX_SILENCE'),
-    id='dj_priority_harbor_strip',
+    id=dj_priority_id,
     start_blank=true,
     audio_to_stereo(id='dj_priority_harbor_audio_to_stereo', dj_priority_harbor),
 )
@@ -119,9 +126,12 @@ if DJ_AUTH_ENABLED then
 end
 
 dj_raw_data = ref 'disconnected'
+dj_name = ref 'N/A'
+dj_password = ref ''
 dj_login_time = ref -1.
 dj_kickoff_time = ref -1.
 dj_just_booted = ref false
+dj_ban_list = ref []
 dj_harbor = input.harbor(
     conf('DJ_MOUNT_NAME'),
     id='dj_harbor',
@@ -134,24 +144,44 @@ dj_harbor = input.harbor(
             dj_raw_data := 'master'
             true
         elsif DJ_AUTH_ENABLED then
-            cmd_output = get_process_output('#{auth_cmd} #{pass}')
-            dj_raw_data := cmd_output
-            data = of_json(default=[], cmd_output)
-            bool_data = of_json(default=[], cmd_output)
-
-            if list.assoc(default=false, 'valid_user', bool_data) then
-                if DJ_AUTH_ENFORCE_SCHEDULE then
-                    allow = list.assoc(default=false, 'authorized', bool_data)
-                    log('#{if allow then "Accepted" else "Rejected" end} password for DJ "#{data["name"]}", '
-                        ^ 'authorized for window #{data["start"]} to #{data["end"]}')
-                    allow
-                else
-                    log('Accepted password for DJ "#{data["name"]}" (schedule unenforced by config)')
-                    true
+            is_banned = ref false
+            ignore(list.map(fun(ban) -> begin
+                password = fst(ban)
+                until = snd(ban)
+                if sanitize_password(pass) == password and time() < until then
+                    is_banned := true
+                    log('Password "#{pass}" currently in ban list')
                 end
-            else
-                log('Rejected password "#{pass}"')
+                if time() >= until then
+                    dj_ban_list := list.remove_assoc(password, !dj_ban_list)
+                end
+            end, !dj_ban_list))
+
+            log('ban list: #{string_of(!dj_ban_list)}')
+
+            if !is_banned then
+                log('Password "#{pass}" currently in ban list')
                 false
+            else
+                cmd_output = get_process_output('#{auth_cmd} #{pass}')
+                dj_raw_data := cmd_output
+                data = of_json(default=[], cmd_output)
+                bool_data = of_json(default=[], cmd_output)
+
+                if list.assoc(default=false, 'valid_user', bool_data) then
+                    if DJ_AUTH_ENFORCE_SCHEDULE then
+                        allow = list.assoc(default=false, 'currently_authorized', bool_data)
+                        log('#{if allow then "Accepted" else "Rejected" end} password for DJ "#{data["name"]}", '
+                            ^ 'authorized for window #{data["start"]} to #{data["end"]}')
+                        allow
+                    else
+                        log('Accepted password for DJ "#{data["name"]}" (schedule unenforced by config)')
+                        true
+                    end
+                else
+                    log('Rejected password "#{pass}"')
+                    false
+                end
             end
         else
             log('Rejected password "#{pass}" (DJ auth disabled)')
@@ -166,19 +196,21 @@ dj_harbor = input.harbor(
         end
 
         dj_login_time := time()
-        log_line = '#{list.assoc(default="Master DJ", "name", data)} connected'
-        log(log_line)
-        notify(log_line, '#{!dj_raw_data}\n#{ip_address}\n\n#{json_of(headers)}')
+        dj_name := list.assoc(default='Master DJ', 'name', data)
+        dj_password := data['password_sanitized']
+        log('#{!dj_name} connected')
+        notify('#{!dj_name} connected', '#{!dj_name} connected\n#{ip_address}\n\n#{json_of(headers)}')
     end,
     on_disconnect=fun() -> begin
         dj_kickoff_time := -1.
         if !dj_raw_data != 'disconnected' then
-            data = of_json(default=[], !dj_raw_data)
             total_time = pretty_seconds(time() - !dj_login_time)
-            log_line = '#{list.assoc(default="Master DJ", "name", data)} disconnected after #{total_time}'
+            log_line = '#{!dj_name} disconnected after #{total_time}'
                        ^ if !dj_just_booted then ' (kicked off)' else '' end
             dj_just_booted := false
             dj_raw_data := 'disconnected'
+            dj_name := 'N/A'
+            dj_password := ''
             log(log_line)
             notify(log_line)
         end
@@ -200,9 +232,10 @@ if DJ_AUTH_ENFORCE_SCHEDULE then
     end)
 end
 
+dj_id = 'dj_harbor_strip'
 dj_harbor = strip_blank(
     max_blank=conf.float('DJ_MAX_SILENCE'),
-    id='dj_harbor_strip',
+    id=dj_id,
     start_blank=true,
     audio_to_stereo(id='dj_harbor_audio_to_stereo', dj_harbor),
 )
@@ -215,9 +248,10 @@ pulse_in = input.pulseaudio(device=PULSE_DEVICE)
 output.dummy(id='pulse_in', pulse_in)
 
 PULSE_MAX_SILENCE = conf.float('PULSE_MAX_SILENCE')
+pulse_in_id = 'pulse_in_strip'
 pulse_in = strip_blank(
     max_blank=PULSE_MAX_SILENCE,
-    id='pulse_in_strip',
+    id=pulse_in_id,
     start_blank=true,
     pulse_in,
 )
@@ -225,7 +259,8 @@ pulse_in = strip_blank(
 
 ### Failsafe mp3 (last resort) ###
 FAILSAFE_PATH = conf('FAILSAFE_PATH')
-failsafe = single(id='failsafe', FAILSAFE_PATH)
+failsafe_id = 'failsafe'
+failsafe = single(id=failsafe_id, FAILSAFE_PATH)
 
 
 ## AutoDJ ###
@@ -320,7 +355,9 @@ autodj = request.dynamic.list(id='autodj', length=conf.float('REQUEST_QUEUE_LENG
         end
     )]
 end)
-autodj = audio_to_stereo(id='autodj_to_stereo', autodj)
+
+autodj_id = 'autodj_to_stereo'
+autodj = audio_to_stereo(id=autodj_id, autodj)
 
 
 ### Fallback radio ###
@@ -349,6 +386,8 @@ def crossfade(~source, one, two)
     ])
 end
 
+STREAMS_PRETTY = [(dj_priority_id, 'Remote DJ (priority)'), (dj_id, 'Remote DJ'),
+                  (pulse_in_id, 'Pulseaudio (Zoom)'), (autodj_id, 'AutoDJ'), (failsafe_id, 'Failsafe')]
 radio_fallback_precedence = [dj_priority_harbor, dj_harbor, pulse_in, autodj, failsafe]
 radio = fallback(
     id='radio',
@@ -366,8 +405,8 @@ end
 
 
 ### Icecast output (wave format) ###
-connections = ref []
 INTERNAL_HARBOR_PASSWORD = conf('INTERNAL_HARBOR_PASSWORD')
+connections = ref []
 output.harbor(
     %wav(duration=0., stereo=true, channels=2, samplesize=16, header=true),
     id='broadcast',
@@ -386,7 +425,107 @@ output.harbor(
         connections := list.remove_assoc(ip, !connections)
         log('Upstream "#{upstream}" disconnected')
     end,
-    radio
+    radio,
 )
 
 notify('Harbor came online', 'This does not necessarily mean listeners were disconnected')
+
+
+### Status page
+def protected(func)
+    fun(~protocol, ~data, ~headers, uri) -> begin
+        auth = headers['Authorization']
+        allowed = if auth == '' then false else
+            auth = string.extract(pattern='^Basic (.+)$', auth)
+            if list.length(auth) > 0 then
+                auth = string.extract(pattern='^[^:]*:(.*)', base64.decode(auth['1']))
+                if list.length(auth) > 0 then
+                    list.mem(auth["1"], DJ_MASTER_PASSWORDS)
+                else
+                    false
+                end
+            else
+                false
+            end
+        end
+
+        if allowed then
+            func(protocol=protocol, data=data, headers=headers, uri)
+        else
+            auth_headers = [('WWW-Authenticate', 'Basic realm="Password Required", charset="UTF-8"')]
+            http_response(protocol=protocol, code=401, headers=auth_headers, data='')
+        end
+    end
+end
+
+
+def status_json()
+    data = [('stream', list.assoc(default='Unknown', !current_stream, STREAMS_PRETTY))]
+    json_of(compact=true, list.append(data,
+        if !current_stream == dj_priority_id then
+            [('conn_timedelta', pretty_seconds(time() - !dj_priority_login_time)), ('dj_name', 'Master DJ'),
+             ('kickoff_time', 'N/A')]
+        elsif !current_stream == dj_id then
+            [('conn_timedelta', pretty_seconds(time() - !dj_login_time)), ('dj_name', !dj_name),
+             ('kickoff_time', if !dj_kickoff_time >= 0. then string_of(!dj_kickoff_time) else 'N/A' end)]
+        else
+            [('conn_timedelta', 'N/A'), ('dj_name', 'N/A'), ('kickoff_time', 'N/A')]
+        end
+    ))
+end
+
+
+HTML = file.contents('status.html')
+harbor.http.register(
+    port=conf.int('DJ_PORT'), method='GET', '^/status/?$',
+    protected(fun(~protocol, ~data, ~headers, uri) -> begin
+        html = if daemonize then HTML else file.contents('status.html') end
+        html = string.replace(pattern='__JSON_DATA__', fun(_) -> status_json(), html)
+        http_response(protocol=protocol, code=200, headers=[('Content-Type', 'text/html')], data=html)
+    end))
+
+harbor.http.register(
+    port=conf.int('DJ_PORT'), method='GET', '^/status/data\\.json$',
+    protected(fun(~protocol, ~data, ~headers, uri) ->
+        http_response(protocol=protocol, code=200, headers=[('Content-Type', 'application/json')], data=status_json())))
+
+harbor.http.register(
+    port=conf.int('DJ_PORT'), method='POST', '^/status/password\\.text$',
+    protected(fun(~protocol, ~data, ~headers, uri) -> begin
+        text = if list.mem(data, DJ_MASTER_PASSWORDS) then
+            'Master DJ Password. Always authorized.'
+        else
+            get_process_output('#{auth_cmd} -f #{string.escape(data)}')
+        end
+
+        http_response(protocol=protocol, code=200, headers=[('Content-Type', 'text/plain')], data=text)
+    end))
+
+harbor.http.register(
+    port=conf.int('DJ_PORT'), method='POST', '^/status/kick\\.text$',
+    protected(fun(~protocol, ~data, ~headers, uri) -> begin
+        kicked_dj = if !dj_kickoff_time >= 0.0 and !dj_password != '' then
+            log('data: "#{data}"')
+            kicked_dj = !dj_name
+            if data == 'forever' then
+                dj_ban_list := list.add((!dj_password, -1.), !dj_ban_list)
+            elsif int_of_string(data) > 0 then
+                dj_ban_list := list.add((!dj_password, time() + float_of_string(data)), !dj_ban_list)
+            end
+            log('ban list: #{string_of(!dj_ban_list)}')
+            dj_kickoff_time := -1.
+            dj_just_booted := true
+            log('Booting DJ from UI')
+            ignore(server.execute('dj_harbor.stop'))
+            kicked_dj
+        else
+            'No DJ currently eligible to be'
+        end
+
+        #kick_amount if data == 'forever' then -1. else time() + float_of_string(data) end
+
+        # log('amount: #{string_of(amount)}')
+
+        #headers=[('Location', '/status/')]
+        http_response(protocol=protocol, code=200, headers=[('Content-Type', 'text/plain')], data='#{kicked_dj} kicked off')
+    end))
